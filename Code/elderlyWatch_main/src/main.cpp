@@ -15,6 +15,15 @@
 #include <esp_pm.h>
 #include <esp_cpu.h>
 
+TaskHandle_t BLE_handler = NULL;
+TaskHandle_t Audio_handler = NULL;
+TaskHandle_t BPM_handler = NULL;
+TaskHandle_t accln_handler = NULL;
+
+// Mutexes for shared variable protection
+SemaphoreHandle_t xMutex_audio = NULL;  // protects: playing, aac, file
+SemaphoreHandle_t xMutex_data  = NULL;  // protects: delta, irValue, beatAvg
+
 //BLE Server name (the other ESP32 name running the server sketch)
 #define bleServerName "Elderly Watch V1.1"
 // Characteristic to notify the button state
@@ -41,6 +50,7 @@ byte rateSpot = 0;
 long lastBeat = 0; //Time at which the last beat occurred
 float beatsPerMinute;
 int beatAvg;
+long irValue;
 
 //Audio objects
 AudioFileSourcePROGMEM *file;
@@ -58,6 +68,7 @@ const float ZERO_G = 1.65;        // ~1.65V at 0g
 const float SENSITIVITY = 0.300;  // 300mV/g = 0.300V/g
 float prev_mag = 0;
 const float VIB_THRESHOLD = 1.1;  // vibration threshold in g
+float delta = 0.00;
 
 float readAxis(int pin)
 {
@@ -67,10 +78,161 @@ float readAxis(int pin)
   return g;
 }
 
+//set BLE task
+void BLE_TASK(void *parameter){
+  while(1){
+    // Take snapshot of shared variables under mutex
+    float snap_delta;
+    bool snap_playing;
+    long snap_irValue;
+    int snap_beatAvg;
+
+    if (xSemaphoreTake(xMutex_data, portMAX_DELAY)) {
+      snap_delta   = delta;
+      snap_irValue = irValue;
+      snap_beatAvg = beatAvg;
+      xSemaphoreGive(xMutex_data);
+    }
+    if (xSemaphoreTake(xMutex_audio, portMAX_DELAY)) {
+      snap_playing = playing;
+      xSemaphoreGive(xMutex_audio);
+    }
+
+    String mesString;
+    mesString += "M" + String(snap_delta);
+    mesString += snap_playing ? "-Vib-" : "-Safe-";
+    mesString += snap_irValue<50000 ? "PF" : String(snap_beatAvg);
+
+    //send data over bluetooth
+    if (deviceConnected) {
+      pCharacteristic->setValue(mesString);
+      pCharacteristic->notify(); //max 20 bytes per second, so we add a delay to avoid congestion
+    }
+    vTaskDelay(10/portTICK_PERIOD_MS); // Always delay regardless of connection state
+  }
+}
+
+//set audio tasks
+void AUDIO_TASK(void *parameter){
+  while(1){
+    //keep playing until finished
+    if (xSemaphoreTake(xMutex_audio, portMAX_DELAY)) {
+      if(playing) {
+        if (aac->isRunning()) {
+          aac->loop();
+        } else {    
+          aac -> stop(); 
+          playing = false; 
+          Serial.printf("Sound finished\n");
+        }
+      }
+      xSemaphoreGive(xMutex_audio);
+    }
+    vTaskDelay(1/portTICK_PERIOD_MS); // Always yield every iteration to avoid starving other tasks
+  }
+}
+
+//set BPM tasks
+void BPM_TASK(void *parameter){
+  while(1){
+    // Heart rate measurement
+  long snap_irValue = particleSensor.getIR();
+
+  if (checkForBeat(snap_irValue) == true) {
+    // We sensed a beat!
+    long beatDelta = millis() - lastBeat; // renamed from 'delta' to avoid shadowing global delta
+    lastBeat = millis();
+    beatsPerMinute = 60 / (beatDelta / 1000.0);
+    if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+      rates[rateSpot++] = (byte)beatsPerMinute; //Store this reading in
+      rateSpot %= RATE_SIZE; //Wrap variable
+      //Take average of readings
+      int localAvg = 0;
+      for (byte x = 0; x < RATE_SIZE; x++)
+        localAvg += rates[x];
+      localAvg /= RATE_SIZE;
+
+      // Write shared variables under mutex
+      if (xSemaphoreTake(xMutex_data, portMAX_DELAY)) {
+        beatAvg  = localAvg;
+        irValue  = snap_irValue;
+        xSemaphoreGive(xMutex_data);
+      }
+    }
+    Serial.print("IR=");
+    Serial.print(snap_irValue);
+    Serial.print(" BPM=");
+    Serial.print(beatsPerMinute);
+    Serial.print(" Avg BPM=");
+    Serial.println(beatAvg);
+  }
+
+  // Update irValue even when no beat detected so BLE task stays current
+  if (xSemaphoreTake(xMutex_data, portMAX_DELAY)) {
+    irValue = snap_irValue;
+    xSemaphoreGive(xMutex_data);
+  }
+
+  if (snap_irValue < 50000) {
+    Serial.println("No finger detected");
+  }
+  vTaskDelay(10/portTICK_PERIOD_MS);
+}
+}
+
+//void accln tasks
+void ACCLN_TASK(void *parameter){
+  while(1){
+  // Read raw analog values from accelerometer axes and convert to g's
+  float x = readAxis(X_PIN);
+  float y = readAxis(Y_PIN);
+  float z = readAxis(Z_PIN);
+
+  // acceleration magnitude
+  float mag = sqrt(x*x + y*y + z*z);
+
+  // detect sudden vibration
+  float local_delta = abs(mag - prev_mag);
+
+  // Write delta under mutex
+  if (xSemaphoreTake(xMutex_data, portMAX_DELAY)) {
+    delta = local_delta;
+    xSemaphoreGive(xMutex_data);
+  }
+
+  Serial.println(local_delta);
+
+  // Check playing state and trigger audio under mutex to prevent use-after-free
+  if (xSemaphoreTake(xMutex_audio, portMAX_DELAY)) {
+    if (local_delta > VIB_THRESHOLD && !playing) {
+      Serial.print("Vibration detected! ");
+      Serial.println(local_delta);
+      //play sound
+      delete aac; // Clean up previous generator if it exists
+      delete file; // Clean up previous file source if it exists
+      aac = new AudioGeneratorAAC(); // Create a new generator instance
+      file = new AudioFileSourcePROGMEM(sampleaac, sizeof(sampleaac));
+      aac->begin(file, out); // Start the audio generator with the file source and output
+      playing = true;
+    }
+    xSemaphoreGive(xMutex_audio);
+  }
+
+  prev_mag = mag; //store current magnitude of g value to previous magnitude value
+  vTaskDelay(10/portTICK_PERIOD_MS);
+  //delay(5); // Adjust delay as needed for responsiveness
+}
+}
+
+
 void setup()
 {
   Serial.begin(115200);
   analogReadResolution(12); // Set ADC resolution to 12 bits
+
+  // Create mutexes before starting any tasks
+  xMutex_audio = xSemaphoreCreateMutex();
+  xMutex_data  = xSemaphoreCreateMutex();
 
   //disable wifi to save power and avoid interference with BLE
   WiFi.mode(WIFI_OFF);
@@ -118,82 +280,45 @@ void setup()
   particleSensor.setup(); //Configure sensor with default settings
   particleSensor.setPulseAmplitudeRed(0x0A); //Turn Red LED to low to indicate sensor is running
   particleSensor.setPulseAmplitudeGreen(0); //Turn off Green LED
+
+  xTaskCreatePinnedToCore(
+    BLE_TASK,
+    "Bluetooth low energy tasks",
+    4096,
+    NULL,
+    2,
+    &BLE_handler,
+    1);
+
+  xTaskCreatePinnedToCore(
+    AUDIO_TASK,
+    "Audio playback",
+    8192,
+    NULL,
+    1,    // Lowered from 5 → 1 so it doesn't starve BPM and ACCLN tasks
+    &Audio_handler,
+    1);
+
+  xTaskCreatePinnedToCore(
+    BPM_TASK,
+    "heart rate monitoring",
+    4096,
+    NULL,
+    3,
+    &BPM_handler,
+    1);
+
+  xTaskCreatePinnedToCore(
+    ACCLN_TASK,
+    "accelerometer monitoring",
+    4096,  // Increased from 2048 → 4096 for float math + Serial headroom
+    NULL,
+    2,
+    &accln_handler,
+    1);
 }
 
 void loop()
 {
-  // Read raw analog values from accelerometer axes and convert to g's
-  float x = readAxis(X_PIN);
-  float y = readAxis(Y_PIN);
-  float z = readAxis(Z_PIN);
-
-  // acceleration magnitude
-  float mag = sqrt(x*x + y*y + z*z);
-  // detect sudden vibration
-  float delta = 0.00;
-  delta = abs(mag - prev_mag);
-  Serial.println(delta);
-
-  if (delta > VIB_THRESHOLD && !playing) {
-    Serial.print("Vibration detected! ");
-    Serial.println(delta);
-    //play sound
-    delete aac; // Clean up previous generator if it exists
-    delete file; // Clean up previous file source if it exists
-    aac = new AudioGeneratorAAC(); // Create a new generator instance
-    file = new AudioFileSourcePROGMEM(sampleaac, sizeof(sampleaac));
-    aac->begin(file, out); // Start the audio generator with the file source and output
-    playing = true;
-  }
-  //keep playing until finished
-  if(playing) {
-    if (aac->isRunning()) {
-      aac->loop();
-    } else {    
-      aac -> stop(); 
-      playing = false; 
-      Serial.printf("Sound finished\n");
-    }
-  }
-  prev_mag = mag; //store current magnitude of g value to previous magnitude value
-  delay(5); // Adjust delay as needed for responsiveness
-
-    // Heart rate measurement
-  long irValue = particleSensor.getIR();
-  if (checkForBeat(irValue) == true) {
-    // We sensed a beat!
-    long delta = millis() - lastBeat;
-    lastBeat = millis();
-    beatsPerMinute = 60 / (delta / 1000.0);
-    if (beatsPerMinute < 255 && beatsPerMinute > 20) {
-      rates[rateSpot++] = (byte)beatsPerMinute; //Store this reading in
-      rateSpot %= RATE_SIZE; //Wrap variable
-      //Take average of readings
-      beatAvg = 0;
-      for (byte x = 0; x < RATE_SIZE; x++)
-        beatAvg += rates[x];
-      beatAvg /= RATE_SIZE;
-    }
-    Serial.print("IR=");
-    Serial.print(irValue);
-    Serial.print(" BPM=");
-    Serial.print(beatsPerMinute);
-    Serial.print(" Avg BPM=");
-    Serial.println(beatAvg);
-  }
-  if (irValue < 50000) {
-    Serial.println("No finger detected");
-  }
-
-  String mesString;
-  mesString += "M" + String(delta);
-  mesString += playing ? "-Vib-" : "-Safe-";
-  mesString += irValue<50000 ? "PF" : String(beatAvg);
-
-    //send data over bluetooth
-    if (deviceConnected) {
-    pCharacteristic->setValue(mesString);
-    pCharacteristic->notify(); //max 20 bytes per second, so we add a delay to avoid congestion
-    delay(10); // bluetooth stack will go into congestion, if too many packets are sent
-  }
+vTaskDelay(portMAX_DELAY);
 }
